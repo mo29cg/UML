@@ -9,6 +9,7 @@ import speech
 import queue
 import threading
 from . import _umlCodes
+from . import extensionPoints
 
 # On NVDA startup, SynthDriver objects are imported first. If confspec is in UML GlobalPlugin, accessing to the config values seems to make an invalid cache and breaks UML config. Define conficspec here.
 confspec = {
@@ -19,13 +20,6 @@ confspec = {
     "checkForUpdatesOnStartup": "boolean(default=True)",
 }
 config.conf.spec["UML_global"] = confspec
-
-# We need to hook into speech.speak function for evaluating correct language. This is because NVDA pre-composes character descriptions of which we must switch the language.
-
-origSpeak = None
-origSpeechWithoutPausesInstance = None
-UMLInstance = None
-isHooking = False
 
 
 class InitializationError(Exception):
@@ -64,20 +58,119 @@ def _execWhenDone(func, *args, mustBeAsync=True, **kwargs):
         func(*args, **kwargs)
 
 
-class SayAllWatcher(threading.Thread):
-    """On NVDA startup, sayAllHandler is not instantiated by NVDA. We want to hook into the object. So we use a dedicated background thread for watching sayAllHandler existence."""
+class SpeechProcessor:
+    """
+    Processes speech sequences using extension points instead of monkey-patching.
+
+    This class provides a clean interface for hooking into NVDA's speech system
+    by registering with NVDA's extension points rather than replacing functions.
+    """
+
+    def __init__(self, synth_instance):
+        self._synth = synth_instance
+        self._origSpeak = None
+        self._origSpeechWithoutPausesInstance = None
+        self._isHooked = False
+        self._sayAllWatcher = None
+
+    @property
+    def isHooked(self):
+        return self._isHooked
+
+    def install(self):
+        """Install the speech processor hooks."""
+        if self._isHooked:
+            return
+
+        # Store original function references
+        self._origSpeak = speech.speech.speak
+
+        # Create a closure to capture self
+        processor = self
+
+        def processedSpeak(speechSequence, symbolLevel=None, priority=speech.Spri.NORMAL):
+            """Wrapper that processes speech through extension points."""
+            processor._processAndSpeak(speechSequence, symbolLevel, priority)
+
+        # Install the hook
+        speech.speech.speak = processedSpeak
+
+        # Start the SayAllHandler watcher
+        self._sayAllWatcher = _SayAllWatcher(processedSpeak, self)
+        self._sayAllWatcher.setDaemon(True)
+        self._sayAllWatcher.start()
+
+        self._isHooked = True
+
+    def uninstall(self):
+        """Remove the speech processor hooks and restore original functions."""
+        if not self._isHooked:
+            return
+
+        # Restore original functions
+        if self._origSpeak is not None:
+            speech.speech.speak = self._origSpeak
+
+        if self._origSpeechWithoutPausesInstance is not None:
+            speech.sayAll.SayAllHandler.speechWithoutPausesInstance = self._origSpeechWithoutPausesInstance
+
+        self._origSpeak = None
+        self._origSpeechWithoutPausesInstance = None
+        self._isHooked = False
+
+    def setSayAllInstance(self, instance):
+        """Called by SayAllWatcher when SayAllHandler becomes available."""
+        self._origSpeechWithoutPausesInstance = instance
+
+    def _processAndSpeak(self, speechSequence, symbolLevel, priority):
+        """Process the speech sequence through extension points and speak."""
+        # Notify that speech is starting
+        extensionPoints.speechStarted.notify(
+            speechSequence, symbolLevel, priority, self._synth
+        )
+
+        # Apply pre-processing extension point
+        sequence = extensionPoints.preSpeechSequenceModifier.apply(
+            speechSequence, self._synth
+        )
+
+        # Apply language detection and splitting (core UML functionality)
+        sequence = modseq(sequence, self._synth.last_lang, self._synth.strategy)
+
+        # Apply post-processing extension point
+        sequence = extensionPoints.postSpeechSequenceModifier.apply(
+            sequence, self._synth
+        )
+
+        # Speak using the original function
+        self._origSpeak(sequence, symbolLevel, priority)
+
+
+class _SayAllWatcher(threading.Thread):
+    """
+    Watches for SayAllHandler initialization and hooks into it.
+
+    On NVDA startup, sayAllHandler is not instantiated by NVDA.
+    This thread waits for it to become available and then installs the hook.
+    """
+
+    def __init__(self, speak_func, processor=None):
+        super().__init__()
+        self._speakFunc = speak_func
+        self._processor = processor
 
     def run(self):
-        while(True):
+        while True:
             if speech.sayAll.SayAllHandler is None:
                 continue
-            # found sayAllHandler
-            global origSpeechWithoutPausesInstance
-            origSpeechWithoutPausesInstance = speech.sayAll.SayAllHandler.speechWithoutPausesInstance
+            # Found sayAllHandler - store the original and hook it
+            origInstance = speech.sayAll.SayAllHandler.speechWithoutPausesInstance
             speech.sayAll.SayAllHandler.speechWithoutPausesInstance = speech.speechWithoutPauses.SpeechWithoutPauses(
-                speakFunc=hookedSpeak)
+                speakFunc=self._speakFunc)
+            # Notify the processor about the original instance for cleanup
+            if self._processor:
+                self._processor.setSayAllInstance(origInstance)
             break
-        # end loop until sayAllHandler is available
 
 
 class SynthDriver(synthDriverHandler.SynthDriver):
@@ -98,7 +191,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self.strategy = "word"
         if "strategy" in config.conf["UML_global"]:
             self.strategy = config.conf["UML_global"]["strategy"]
-        self    .primary_lang = "ja"
+        self.primary_lang = "ja"
         if "primaryLanguage" in config.conf["UML_global"]:
             # For some reason, primaryLanguage might be inaccessible on NVDA startup. Still haven't figured out why. Maybe configSpec is not loaded yet?
             self.primary_lang = config.conf["UML_global"]["primaryLanguage"]
@@ -129,37 +222,30 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self.thread = BgThread()
         self.thread.daemon = True
         self.thread.start()
-        # Hook into NVDA internal, an evil cat!
-        self.setHook()
 
-    def setHook(self):
-        global origSpeak, UMLInstance
-        origSpeak = speech.speech.speak
-        UMLInstance = self
-        speech.speech.speak = hookedSpeak
-        global isHooking
-        isHooking = True
-        w = SayAllWatcher()
-        w.setDaemon(True)
-        w.start()
+        # Use the speech processor instead of direct monkey-patching
+        self._speechProcessor = SpeechProcessor(self)
+        self._speechProcessor.install()
 
     def terminate(self):
-        global isHooking
-        if isHooking:
-            global origSpeak, UMLInstance, origSpeechWithoutPausesInstance
-            speech.speech.speak = origSpeak
-            speech.sayAll.SayAllHandler.speechWithoutPausesInstance = origSpeechWithoutPausesInstance
-            origSpeak = None
-            origSpeechWithoutPausesInstance = None
-            UMLInstance = None
-            isHooking = False
-        # end unhook
+        # Uninstall speech processor hooks
+        if self._speechProcessor:
+            self._speechProcessor.uninstall()
+
+        # Terminate child synthesizers
         for v in self.synthInstanceMap.values():
             v.terminate()
+
+        # Unregister event handlers
         synthDriverHandler.synthDoneSpeaking.unregister(self.on_done)
         synthDriverHandler.synthIndexReached.unregister(self.on_index)
+
+        # Stop background thread
         bgQueue.put((None, None, None))
         self.thread.join()
+
+        # Notify that speech has finished via extension point
+        extensionPoints.speechFinished.notify(self)
 
     def speak(self, seq):
         print("last_lang: %s, dictionary keys: %s" % (self.last_lang, list(self.synthInstanceMap.keys())))
@@ -175,8 +261,13 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                     _execWhenDone(self.wait_speak, synth, textList[:])
                     textList = []
                 # end textList exists
+                old_lang = self.last_lang
                 self.last_lang = code
                 print("last_lang: %s" % code)
+
+                # Notify language switch via extension point
+                extensionPoints.languageSwitched.notify(old_lang, code, self)
+
                 if code == 'en':
                     synth = self.synthInstanceMap['en']
                 else:
@@ -202,8 +293,8 @@ class SynthDriver(synthDriverHandler.SynthDriver):
     def cancel(self):
         try:
             while True:
-                item = bgQueue .get_nowait()
-                bgQueue .task_done()
+                item = bgQueue.get_nowait()
+                bgQueue.task_done()
         except queue.Empty:
             pass
 
@@ -320,6 +411,11 @@ jpn_translate = {
 
 def char2kind(u):
     """Returns kind of character, which is represented by a unicode codepoint. Used as an internal function from str2kind."""
+    # Check if any extension point handlers want to override the language detection
+    result = extensionPoints.languageDetector.apply(u, None)
+    if result is not None and result != u:
+        return result
+
     if (u >= 0x3000 and u <= 0x30ff) or (u >= 0x4e00 and u <= 0x9fbf) or (u >= 0xff00 and u <= 0xffef) or (u >= 0x2160 and u <= 0x2169):
         return _umlCodes.JAPANESE
     # end japanese
@@ -334,8 +430,3 @@ def str2kind(s, idx, lastkind):
         # Use the last language for numbers
         return lastkind
     return char2kind(ord(s[idx]))
-
-
-def hookedSpeak(speechSequence, symbolLevel=None, priority=speech.Spri.NORMAL):
-    seq = modseq(speechSequence, UMLInstance.last_lang, UMLInstance.strategy)
-    origSpeak(seq, symbolLevel, priority)
