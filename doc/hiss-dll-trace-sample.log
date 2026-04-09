@@ -1,0 +1,55 @@
+# Raw DLL trace from 2026-02-07 session
+# UML as primary synth, HISS for Japanese, OneCore for English
+# Shows: initialization, initSettings, speech at rate 30, speech at rate 90
+
+# === INITIALIZATION (MainThread) ===
+[23:54:53.325] [MainThread] === Patching _hiss._callHissdll for DLL call tracing ===
+[23:54:53.336] [MainThread] rootDir: C:\Users\suzuki\AppData\Roaming\nvda\addons\HISS
+[23:54:53.346] [MainThread] hissdll before init: None
+[23:54:53.367] [MainThread] DLL hiss_0ac4296814bae9cc(('C:\\Users\\suzuki\\AppData\\Roaming\\nvda\\addons\\HISS',)) -> 0    # globalCreate
+[23:54:53.623] [MainThread] DLL hiss_af65fc9af2e7058b(()) -> 0                                                            # synthCreate
+
+# === initSettings() — custom settings + voice + rateBoost (MainThread) ===
+[23:54:53.659] [MainThread] DLL hiss_d4e2d2f83e9bba09((<cparam 'P' (...)>,)) -> 0    # getCustomSettings (pause)
+[23:54:53.670] [MainThread] DLL hiss_d4e2d2f83e9bba09((<cparam 'P' (...)>,)) -> 0    # getCustomSettings (guess)
+[23:54:53.681] [MainThread] DLL hiss_d4e2d2f83e9bba09((<cparam 'P' (...)>,)) -> 0    # getCustomSettings (highFreqEmphasis)
+[23:54:53.692] [MainThread] DLL hiss_d4e2d2f83e9bba09((<cparam 'P' (...)>,)) -> 0    # getCustomSettings (pauseLength)
+[23:54:53.705] [MainThread] DLL hiss_12917c04f08e21d3((c_long(2),)) -> 0             # setVoice(2) = Takashi
+[23:54:53.732] [MainThread] DLL hiss_8d97e37ab0b7fa89((30,)) -> 0                    # setRateBoost(30) from saved config
+[23:54:53.743] [MainThread] DLL hiss_d4e2d2f83e9bba09(...) -> 0                      # getCustomSettings
+[23:54:53.755] [MainThread] DLL hiss_8f52454edb61bec3(...) -> 0                      # setCustomSettings
+[23:54:53.767] [MainThread] DLL hiss_d4e2d2f83e9bba09(...) -> 0                      # getCustomSettings
+[23:54:53.781] [MainThread] DLL hiss_8f52454edb61bec3(...) -> 0                      # setCustomSettings
+[23:54:53.795] [MainThread] DLL hiss_d4e2d2f83e9bba09(...) -> 0                      # getCustomSettings
+[23:54:53.807] [MainThread] DLL hiss_8f52454edb61bec3(...) -> 0                      # setCustomSettings
+[23:54:53.819] [MainThread] DLL hiss_d4e2d2f83e9bba09(...) -> 0                      # getCustomSettings
+[23:54:53.831] [MainThread] DLL hiss_8f52454edb61bec3(...) -> 0                      # setCustomSettings
+
+# === SPEECH: "こんにちは" at rate=30 (HISS BgThread) ===
+[23:55:08.085] [synthDrivers.UML.BgThread] apply[ja]: master_rate=30 offset=0 eff_rate=30 eff_vol=95
+[23:55:08.098] [synthDrivers._hiss.BgThread] DLL hiss_36c85d27bb90659a((30,)) -> 0   # setRate(30)
+[23:55:08.109] [synthDrivers._hiss.BgThread] DLL hiss_d73044c16fa6f300((50,)) -> 0   # setPitch(50)
+[23:55:08.121] [synthDrivers._hiss.BgThread] DLL hiss_c7508f15a2a46ff6((2,)) -> 0    # setInflection(2)
+[23:55:08.132] [synthDrivers._hiss.BgThread] DLL hiss_cddcb5e092c14715((95,)) -> 0   # setVolume(95)
+[23:55:08.146] [synthDrivers._hiss.BgThread] DLL hiss_1aacc2adaf24abf2(('こんにちは ',)) -> 0   # startSynth
+[23:55:08.161] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:08.173] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:08.189] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:08.202] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:08.215] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 0      # process (DONE) — 5 chunks total
+[23:55:08.522] [synthDrivers._hiss.BgThread] DLL hiss_98db9446a625612d(()) -> 0       # stopSynth
+
+# === SPEECH: "こんにちは" at rate=90 (HISS BgThread) ===
+[23:55:11.444] [synthDrivers.UML.BgThread] apply[ja]: master_rate=90 offset=0 eff_rate=90 eff_vol=95
+[23:55:11.456] [synthDrivers._hiss.BgThread] DLL hiss_36c85d27bb90659a((90,)) -> 0   # setRate(90)
+[23:55:11.465] [synthDrivers._hiss.BgThread] DLL hiss_d73044c16fa6f300((50,)) -> 0   # setPitch(50)
+[23:55:11.475] [synthDrivers._hiss.BgThread] DLL hiss_c7508f15a2a46ff6((2,)) -> 0    # setInflection(2)
+[23:55:11.487] [synthDrivers._hiss.BgThread] DLL hiss_cddcb5e092c14715((95,)) -> 0   # setVolume(95)
+[23:55:11.498] [synthDrivers._hiss.BgThread] DLL hiss_1aacc2adaf24abf2(('こんにちは ',)) -> 0   # startSynth
+[23:55:11.511] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:11.523] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 1      # process (CONTINUE)
+[23:55:11.535] [synthDrivers._hiss.BgThread] DLL hiss_bc906576f424f3f9(...) -> 0      # process (DONE) — 3 chunks total
+[23:55:11.780] [synthDrivers._hiss.BgThread] DLL hiss_98db9446a625612d(()) -> 0       # stopSynth
+
+# CONCLUSION: 5 chunks at rate 30, 3 chunks at rate 90 = ~40% less audio data = faster speech.
+# DLL IS responding to rate changes. All return codes are 0 (SUCCESS).

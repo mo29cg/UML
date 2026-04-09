@@ -13,3 +13,11 @@ output/
 UML-snapshot.zip
 UML-snapshot_info.json
 venv/
+.codex
+.codex_write_probe
+.nvda-addon-backups/
+debug.log
+uml_sayall_debug*.log
+test.txt
+test3.txt
+text2.txt

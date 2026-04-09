@@ -9,6 +9,9 @@ from speech.commands import IndexCommand, LangChangeCommand
 import speech
 import queue
 import threading
+import time
+import os
+from datetime import datetime
 from . import _umlCodes
 
 # On NVDA startup, SynthDriver objects are imported first. If confspec is in UML GlobalPlugin, accessing to the config values seems to make an invalid cache and breaks UML config. Define conficspec here.
@@ -38,6 +41,98 @@ class InitializationError(Exception):
 
 
 bgQueue = queue.Queue()
+
+_LOG_BASE = r"\\wsl.localhost\Ubuntu\home\satoshi\GitHub\UML\uml_sayall_debug"
+_LOG_FILE = _LOG_BASE + ".log"
+_LOG_SESSIONS_TO_KEEP = 3
+_LOG_PREVIEW_CHARS = 160
+
+
+def _rotate_debug_logs():
+    oldest = f"{_LOG_BASE}.{_LOG_SESSIONS_TO_KEEP - 1}.log"
+    if os.path.exists(oldest):
+        os.remove(oldest)
+    for i in range(_LOG_SESSIONS_TO_KEEP - 2, 0, -1):
+        src = f"{_LOG_BASE}.{i}.log"
+        dst = f"{_LOG_BASE}.{i + 1}.log"
+        if os.path.exists(src):
+            os.replace(src, dst)
+    if os.path.exists(_LOG_FILE):
+        os.replace(_LOG_FILE, f"{_LOG_BASE}.1.log")
+
+
+def _write_debug_log(event, **fields):
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        payload = " | ".join(f"{k}={v}" for k, v in fields.items())
+        line = f"[{timestamp}] {event}"
+        if payload:
+            line += f" | {payload}"
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _isSayAllRunning():
+    try:
+        return bool(
+            speech.sayAll.SayAllHandler is not None
+            and speech.sayAll.SayAllHandler.isRunning()
+        )
+    except Exception:
+        return False
+
+
+def _summarizeSequence(seq):
+    if seq is None:
+        return {
+            "items": 0,
+            "textItems": 0,
+            "textChars": 0,
+            "indexes": "-",
+            "langs": "-",
+            "preview": "",
+        }
+    textParts = []
+    indexes = []
+    langs = []
+    textItems = 0
+    textChars = 0
+    for item in seq:
+        if isinstance(item, str):
+            textItems += 1
+            textChars += len(item)
+            if len(" ".join(textParts)) < _LOG_PREVIEW_CHARS:
+                textParts.append(item.strip())
+        elif isinstance(item, IndexCommand):
+            indexes.append(str(item.index))
+        elif isinstance(item, LangChangeCommand):
+            langs.append(item.lang)
+    preview = " ".join(part for part in textParts if part)
+    preview = preview.replace("\r", " ").replace("\n", " ")
+    if len(preview) > _LOG_PREVIEW_CHARS:
+        preview = preview[:_LOG_PREVIEW_CHARS] + "..."
+    return {
+        "items": len(seq),
+        "textItems": textItems,
+        "textChars": textChars,
+        "indexes": ",".join(indexes[:6]) if indexes else "-",
+        "langs": ",".join(langs[:6]) if langs else "-",
+        "preview": preview,
+    }
+
+
+def _logSayAll(event, seq=None, force=False, **fields):
+    if not force and not _isSayAllRunning():
+        return
+    summary = _summarizeSequence(seq)
+    payload = {
+        "thread": threading.current_thread().name,
+        **fields,
+        **summary,
+    }
+    _write_debug_log(event, **payload)
 
 
 class BgThread(threading.Thread):
@@ -88,10 +183,15 @@ class SayAllWatcher(threading.Thread):
 class SynthDriver(synthDriverHandler.SynthDriver):
     name = 'UML'
     description = 'Universal multilingual'
-    supportedSettings = (
+    _supportedSettings = [
         synthDriverHandler.SynthDriver.VolumeSetting(),
         synthDriverHandler.SynthDriver.RateSetting(),
-    )
+    ]
+    if hasattr(synthDriverHandler.SynthDriver, "RateBoostSetting"):
+        _supportedSettings.append(
+            synthDriverHandler.SynthDriver.RateBoostSetting()
+        )
+    supportedSettings = tuple(_supportedSettings)
     supportedCommands = {IndexCommand, }
     supportedNotifications = {
         synthDriverHandler.synthIndexReached, synthDriverHandler.synthDoneSpeaking
@@ -103,6 +203,8 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         return True
 
     def __init__(self):
+        _rotate_debug_logs()
+        _write_debug_log("uml_init")
         self.strategy = "word"
         if "strategy" in config.conf["UML_global"]:
             self.strategy = config.conf["UML_global"]["strategy"]
@@ -129,9 +231,23 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         # end load synth for all languages
         self._volume = 100
         self._rate = 50
+        self._rateBoost = True
         self.cur_synth = None
-        self.lock = threading.Lock()
+        # Some backends (notably HISS) can fire index / done callbacks
+        # synchronously on the calling thread while synth.speak is still on stack.
+        # This must be re-entrant, otherwise on_index/on_done can deadlock
+        # against wait_speak on leading callback indexes.
+        self.lock = threading.RLock()
         self.lastindex = None
+        self._internalIndexBase = 1000000000
+        self._nextInternalIndex = self._internalIndexBase
+        self._activeWaitIndex = None
+        self._activeWaitIndexEvent = None
+        self._activeWaitIndexIsInternal = False
+        self._markerSupportBySynth = {}
+        self._cancelWaitEvent = threading.Event()
+        self._debugSpeakSeq = 0
+        self._debugWaitSeq = 0
         synthDriverHandler.synthDoneSpeaking.register(self.on_done)
         synthDriverHandler.synthIndexReached.register(self.on_index)
         self.done = threading.Event()
@@ -146,6 +262,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         origSpeak = speech.speech.speak
         UMLInstance = self
         speech.speech.speak = hookedSpeak
+        _write_debug_log("setHook")
         global isHooking
         isHooking = True
         w = SayAllWatcher()
@@ -154,6 +271,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
     def terminate(self):
         global isHooking
+        _write_debug_log("terminate_start", isHooking=isHooking, force=True)
         if isHooking:
             global origSpeak, UMLInstance, origSpeechWithoutPausesInstance
             speech.speech.speak = origSpeak
@@ -169,8 +287,18 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         synthDriverHandler.synthIndexReached.unregister(self.on_index)
         bgQueue.put((None, None, None))
         self.thread.join()
+        _write_debug_log("terminate_done", force=True)
 
     def speak(self, seq):
+        self._debugSpeakSeq += 1
+        speakId = self._debugSpeakSeq
+        _logSayAll(
+            "uml_speak_enter",
+            seq,
+            speakId=speakId,
+            lastLang=self.last_lang,
+            strategy=self.strategy,
+        )
         synth = self.synthInstanceMap[self.last_lang]
         textList = []
         for i, item in enumerate(seq):
@@ -180,8 +308,20 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                 if code == self.last_lang:
                     continue
                 if textList:
-                    _execWhenDone(self.wait_speak, synth, textList[:])
-                    textList = []
+                    if any(isinstance(entry, str) for entry in textList):
+                        _logSayAll(
+                            "uml_speak_flush_before_lang_switch",
+                            textList,
+                            speakId=speakId,
+                            fromLang=self.last_lang,
+                            toLang=code,
+                            synth=id(synth),
+                        )
+                        _execWhenDone(self.wait_speak, synth, textList[:])
+                        textList = []
+                    # Preserve leading callback / boundary indexes until they can be
+                    # attached to the next real text chunk. Firing them early can
+                    # desynchronize say-all on structured content.
                 # end textList exists
                 self.last_lang = code
                 if code == 'en':
@@ -195,11 +335,31 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                 textList.append(item)
         # do the final speaking
         if textList:
+            _logSayAll(
+                "uml_speak_flush_final",
+                textList,
+                speakId=speakId,
+                lang=self.last_lang,
+                synth=id(synth),
+            )
             _execWhenDone(self.wait_speak, synth, textList[:])
             textList = []
+        _logSayAll("uml_speak_notify_done", speakId=speakId)
         _execWhenDone(self.notify_done)
 
     def wait_speak(self, synth, seq):
+        self._debugWaitSeq += 1
+        waitId = self._debugWaitSeq
+        _logSayAll(
+            "wait_speak_enter",
+            seq,
+            force=True,
+            waitId=waitId,
+            synth=id(synth),
+            markerSupport=self._markerSupportBySynth.get(id(synth), True),
+            sayAllRunning=_isSayAllRunning(),
+            queueDepth=bgQueue.unfinished_tasks,
+        )
         # If seq contains no text (e.g. only IndexCommands from a language switch
         # boundary), skip the engine entirely and fire index notifications directly.
         # Without this, two deadlocks can occur:
@@ -208,20 +368,129 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         #   2. HISS may run indexReached synchronously on the calling thread when
         #      there is no text, which re-enters self.lock and deadlocks.
         if not any(isinstance(item, str) for item in seq):
+            _write_debug_log(
+                "wait_speak_textless",
+                thread=threading.current_thread().name,
+                waitId=waitId,
+                synth=id(synth),
+                indexes=_summarizeSequence(seq)["indexes"],
+            )
             for item in seq:
                 if isinstance(item, IndexCommand):
                     synthDriverHandler.synthIndexReached.notify(
                         synth=self, index=item.index
                     )
             return
+        synthKey = id(synth)
+        useMarker = self._markerSupportBySynth.get(synthKey, True)
+        markerIndex = None
+        markerEvent = None
+        markerIsInternal = False
+        seqToSpeak = list(seq)
+        if useMarker:
+            textChars = sum(len(item) for item in seq if isinstance(item, str))
+            indexTimeoutSec = self._estimateIndexTimeoutSec(textChars)
+            markerEvent = threading.Event()
+            trailingIndex = seq[-1] if seq and isinstance(seq[-1], IndexCommand) else None
+            if trailingIndex and not self._isInternalIndex(trailingIndex.index):
+                # Reuse NVDA's own trailing index when available. Appending an internal
+                # marker after it can cause some synths to skip the external end index,
+                # which then stalls say-all progression on structured content.
+                markerIndex = trailingIndex.index
+                _logSayAll(
+                    "wait_speak_marker_reuse_external",
+                    seq,
+                    force=True,
+                    waitId=waitId,
+                    markerIndex=markerIndex,
+                    timeoutSec=indexTimeoutSec,
+                    synth=id(synth),
+                )
+            else:
+                # IMPORTANT: We must correlate completion per utterance (not only per synth),
+                # otherwise stale done events from a prior utterance can release this wait
+                # too early (same synth object). See addon/doc/en/dev-utterance-completion.md.
+                markerIndex = self._allocateInternalIndex()
+                markerIsInternal = True
+                seqToSpeak.append(IndexCommand(markerIndex))
+                _logSayAll(
+                    "wait_speak_marker_allocated",
+                    seq,
+                    force=True,
+                    waitId=waitId,
+                    markerIndex=markerIndex,
+                    timeoutSec=indexTimeoutSec,
+                    synth=id(synth),
+                )
         with self.lock:
             self.done.clear()
+            self._cancelWaitEvent.clear()
+            self._activeWaitIndex = markerIndex
+            self._activeWaitIndexEvent = markerEvent
+            self._activeWaitIndexIsInternal = markerIsInternal
             self.cur_synth = synth
             self._applySynthSettings(synth)
-            synth.speak(seq)
-        self.done.wait()
+            _logSayAll(
+                "wait_speak_call_synth",
+                seqToSpeak,
+                force=True,
+                waitId=waitId,
+                markerIndex=markerIndex,
+                synth=id(synth),
+            )
+            synth.speak(seqToSpeak)
+        try:
+            if useMarker:
+                markerWaitResult = self._waitForMarkerOrCancel(
+                    markerEvent, indexTimeoutSec
+                )
+                _write_debug_log(
+                    "wait_speak_marker_result",
+                    thread=threading.current_thread().name,
+                    waitId=waitId,
+                    markerIndex=markerIndex,
+                    result=markerWaitResult,
+                    synth=id(synth),
+                )
+                if markerWaitResult == "marker":
+                    self._markerSupportBySynth[synthKey] = True
+                    return
+                if markerWaitResult == "cancel":
+                    return
+                # Fallback path if a backend fails to report index callbacks.
+                self._markerSupportBySynth[synthKey] = False
+                log.warning(
+                    "wait_speak marker timeout: synth=%s marker=%d timeout=%.2fs; falling back to done event"
+                    % (
+                        synth,
+                        markerIndex,
+                        indexTimeoutSec,
+                    )
+                )
+            self.done.wait()
+        finally:
+            with self.lock:
+                if self._activeWaitIndex == markerIndex:
+                    self._activeWaitIndex = None
+                    self._activeWaitIndexEvent = None
+                    self._activeWaitIndexIsInternal = False
+            _write_debug_log(
+                "wait_speak_exit",
+                thread=threading.current_thread().name,
+                waitId=waitId,
+                markerIndex=markerIndex,
+                synth=id(synth),
+            )
 
     def cancel(self):
+        _write_debug_log(
+            "cancel",
+            thread=threading.current_thread().name,
+            sayAllRunning=_isSayAllRunning(),
+            curSynth=id(self.cur_synth) if self.cur_synth else "-",
+            queueDepth=bgQueue.unfinished_tasks,
+            force=True,
+        )
         try:
             while True:
                 item = bgQueue.get_nowait()
@@ -232,23 +501,86 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         for v in self.synthInstanceMap.values():
             v.cancel()
         self.lastindex = None
+        self._cancelWaitEvent.set()
         self.done.set()
 
     def on_done(self, synth):
         if synth == self:
             return
+        _write_debug_log(
+            "on_done",
+            thread=threading.current_thread().name,
+            synth=id(synth),
+            curSynth=id(self.cur_synth) if self.cur_synth else "-",
+            matched=bool(synth == self.cur_synth),
+            sayAllRunning=_isSayAllRunning(),
+            force=True,
+        )
         with self.lock:
             if synth == self.cur_synth:
                 self.done.set()
 
     def notify_done(self):
+        _write_debug_log(
+            "notify_done",
+            thread=threading.current_thread().name,
+            sayAllRunning=_isSayAllRunning(),
+            force=True,
+        )
         synthDriverHandler.synthDoneSpeaking.notify(synth=self)
 
     def on_index(self, synth=None, index=None):
         if synth == self:
             return
+        _write_debug_log(
+            "on_index",
+            thread=threading.current_thread().name,
+            synth=id(synth) if synth else "-",
+            index=index,
+            activeWaitIndex=self._activeWaitIndex,
+            activeWaitIndexIsInternal=self._activeWaitIndexIsInternal,
+            curSynth=id(self.cur_synth) if self.cur_synth else "-",
+            isInternal=self._isInternalIndex(index),
+            sayAllRunning=_isSayAllRunning(),
+            force=True,
+        )
+        with self.lock:
+            if (
+                index == self._activeWaitIndex
+                and synth == self.cur_synth
+                and self._activeWaitIndexEvent is not None
+            ):
+                self._activeWaitIndexEvent.set()
+        if self._isInternalIndex(index):
+            return
         # We dont' care which synth this came from, pass it on
         synthDriverHandler.synthIndexReached.notify(synth=self, index=index)
+
+    def _allocateInternalIndex(self):
+        idx = self._nextInternalIndex
+        self._nextInternalIndex += 1
+        if self._nextInternalIndex > 0x7FFFFFFF:
+            self._nextInternalIndex = self._internalIndexBase
+        return idx
+
+    def _waitForMarkerOrCancel(self, markerEvent, timeoutSec):
+        deadline = time.monotonic() + timeoutSec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            if markerEvent.wait(timeout=min(0.05, remaining)):
+                return "marker"
+            if self._cancelWaitEvent.is_set():
+                return "cancel"
+
+    def _isInternalIndex(self, index):
+        return isinstance(index, int) and index >= self._internalIndexBase
+
+    @staticmethod
+    def _estimateIndexTimeoutSec(textChars):
+        # Scale timeout by text length to cover slower engines, with reasonable bounds.
+        return max(2.0, min(30.0, 2.0 + (float(textChars) / 12.0)))
 
     @property
     def language(self):
@@ -268,6 +600,13 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self._rate = value
         self._applySettings()
 
+    def _get_rateBoost(self):
+        return self._rateBoost
+
+    def _set_rateBoost(self, value):
+        self._rateBoost = bool(value)
+        self._applySettings()
+
     @staticmethod
     def _clampPercent(value):
         return max(0, min(100, int(value)))
@@ -278,6 +617,32 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         except Exception:
             return 0
 
+    def _isLikelyHiss(self, lang, synth):
+        identifier = self.synthIdentifierMap.get(lang, "")
+        if isinstance(identifier, str) and "hiss" in identifier.lower():
+            return True
+        synthClass = getattr(synth, "__class__", None)
+        synthHints = [
+            getattr(synth, "name", ""),
+            getattr(synth, "description", ""),
+            getattr(synthClass, "__name__", ""),
+            getattr(synthClass, "__module__", ""),
+        ]
+        return "hiss" in " ".join(str(item) for item in synthHints).lower()
+
+    def _getRateBoostMode(self, lang, synth):
+        try:
+            currentRateBoost = getattr(synth, "rateBoost")
+        except Exception:
+            currentRateBoost = None
+        if isinstance(currentRateBoost, bool):
+            return "boolean"
+        if isinstance(currentRateBoost, (int, float)):
+            return "numeric"
+        if self._isLikelyHiss(lang, synth):
+            return "numeric"
+        return None
+
     def _applyLangSettings(self, lang, synth):
         eff_rate = self._clampPercent(self._rate + self._getOffset("rate", lang))
         eff_vol = self._clampPercent(self._volume + self._getOffset("volume", lang))
@@ -285,6 +650,18 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             synth.rate = eff_rate
         except Exception:
             pass
+        rateBoostMode = self._getRateBoostMode(lang, synth)
+        if rateBoostMode == "boolean":
+            try:
+                synth.rateBoost = self._rateBoost
+            except Exception:
+                pass
+        elif rateBoostMode == "numeric":
+            targetRateBoost = eff_rate if self._rateBoost else 0
+            try:
+                synth.rateBoost = targetRateBoost
+            except Exception:
+                pass
         try:
             synth.volume = eff_vol
         except Exception:
@@ -358,10 +735,9 @@ def stringsplit_sentence(s, last_lang):
 def modseq(seq, last_lang, strategy):
     """NVDA's LangChangeCommand only refers markup information like html lang attribute. We want more dynamic change. Process the input sequence and insert LangChangeCommand here."""
     newseq = []
-    for i, item in enumerate(seq):
-        if isinstance(item, IndexCommand) and len(seq)-1 > i and isinstance(seq[i+1], IndexCommand):
-            # Continuous IndexCommand should be ignored.
-            continue
+    for item in seq:
+        # NVDA uses every IndexCommand for callback delivery and utterance boundaries.
+        # Dropping adjacent indexes can break say-all continuation on structured content.
         if isinstance(item, LangChangeCommand):
             # Prioritize original LangChangeCommand
             continue
@@ -407,5 +783,17 @@ def str2kind(s, idx, lastkind):
 
 
 def hookedSpeak(speechSequence, symbolLevel=None, priority=speech.Spri.NORMAL):
+    if UMLInstance is None:
+        return origSpeak(speechSequence, symbolLevel, priority)
     seq = modseq(speechSequence, UMLInstance.last_lang, UMLInstance.strategy)
+    _logSayAll(
+        "hooked_speak",
+        seq,
+        force=True,
+        sayAllRunning=_isSayAllRunning(),
+        symbolLevel=symbolLevel,
+        priority=priority,
+        inputItems=len(speechSequence) if speechSequence is not None else 0,
+        outputItems=len(seq),
+    )
     origSpeak(seq, symbolLevel, priority)
