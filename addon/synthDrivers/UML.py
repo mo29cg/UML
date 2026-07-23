@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 import os
+import re
 from datetime import datetime
 from . import _umlCodes
 
@@ -42,10 +43,100 @@ class InitializationError(Exception):
 
 bgQueue = queue.Queue()
 
-_LOG_BASE = r"\\wsl.localhost\Ubuntu\home\satoshi\GitHub\UML\uml_sayall_debug"
+_LOG_BASE = r"\\wsl.localhost\Ubuntu\home\satoshi\GitHub\personal\UML\uml_sayall_debug"
 _LOG_FILE = _LOG_BASE + ".log"
 _LOG_SESSIONS_TO_KEEP = 3
-_LOG_PREVIEW_CHARS = 160
+_LOG_PREVIEW_CHARS = 2000
+
+_URL_RE = re.compile(
+    r"""(?ix)
+    (?<![A-Za-z0-9_@])
+    (?:
+        (?:(?:https?|ftp)://(?:[^@\s/]+@)?(?:www\.)?)
+        |www\.
+    )
+    (?:
+        (?:[A-Za-z0-9-]+\.)+(?:[A-Za-z]{2,}|xn--[A-Za-z0-9-]{2,})
+        |(?:[^\s/?#:<>"'()（）「」『』【】\[\]{}<>、。]+\.)+[^\s/?#:<>"'()（）「」『』【】\[\]{}<>、。]{2,}
+        |localhost
+        |(?:\d{1,3}\.){3}\d{1,3}
+        |\[[0-9A-Fa-f:.]+\]
+    )
+    (?::\d{1,5})?
+    (?:[/?#][-A-Za-z0-9._~%!$&*+,;=:@/?#]*)?
+    """
+)
+_URL_FOLDED_CONTINUATION_RE = re.compile(
+    r"""\r?\n
+    (?=[-._~%!$&*+,;=:@/?#])
+    (?!-\s)
+    [-A-Za-z0-9._~%!$&*+,;=:@/?#]+
+    """,
+    re.VERBOSE,
+)
+_URL_FOLDED_BREAK_RE = re.compile(r"\r?\n(?=[-._~%!$&*+,;=:@/?#])")
+_URL_ITEM_CONTINUATION_RE = re.compile(r"^(?!-\s)[-A-Za-z0-9._~%!$&*+,;=:@/?#]+")
+_NUMBER_RE = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+_ENGLISH_ORDINAL_RE = re.compile(
+    r"\d+(?:,\d{3})*(?:st|nd|rd|th)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_JAPANESE_NUMBER_SUFFIXES = (
+    "パーセント",
+    "ポイント",
+    "か月",
+    "カ月",
+    "ヶ月",
+    "箇月",
+    "週間",
+    "時間",
+    "世帯",
+    "文字",
+    "万",
+    "億",
+    "兆",
+    "京",
+    "件",
+    "人",
+    "名",
+    "個",
+    "回",
+    "枚",
+    "台",
+    "本",
+    "冊",
+    "円",
+    "歳",
+    "才",
+    "階",
+    "番",
+    "号",
+    "点",
+    "行",
+    "列",
+    "社",
+    "店",
+    "戸",
+    "組",
+    "匹",
+    "羽",
+    "頭",
+    "脚",
+    "杯",
+    "着",
+    "足",
+    "箱",
+    "袋",
+    "票",
+    "通",
+    "時",
+    "分",
+    "秒",
+    "日",
+    "月",
+    "年",
+    "週",
+)
 
 
 def _rotate_debug_logs():
@@ -682,7 +773,163 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
 def stringsplit(s, last_lang, strategy):
     """Processes speaking text. Returns a newly generated part of SpeechSequence."""
+    if s.strip() == '':
+        return []
+
+    url_matches = list(_URL_RE.finditer(s))
+    if not url_matches:
+        return _stringsplit_text(s, last_lang, strategy)
+
+    lst = []
+    start = 0
+    current_lang = last_lang
+    for match in url_matches:
+        if match.start() < start:
+            continue
+        if match.start() > start:
+            part = _stringsplit_text(s[start:match.start()], current_lang, strategy)
+            lst.extend(part)
+            current_lang = _last_lang_from_sequence(part, current_lang)
+        url_end = _extend_url_end(s, match.end())
+        url = _normalize_url_for_speech(s[match.start():url_end])
+        # Keep URLs intact. Splitting inside a URL can prevent the speech
+        # dictionary from seeing the whole link and can leave path fragments.
+        lst.extend([LangChangeCommand(_umlCodes.ENGLISH), url])
+        current_lang = _umlCodes.ENGLISH
+        start = url_end
+
+    if start < len(s):
+        lst.extend(_stringsplit_text(s[start:], current_lang, strategy))
+    return lst
+
+
+def _stringsplit_text(s, last_lang, strategy):
     return stringsplit_word(s, last_lang) if strategy == "word" else stringsplit_sentence(s, last_lang)
+
+
+def _last_lang_from_sequence(seq, fallback):
+    for item in reversed(seq):
+        if isinstance(item, LangChangeCommand):
+            return item.lang.split("_")[0] if item.lang else fallback
+    return fallback
+
+
+def _extend_url_end(s, end):
+    while True:
+        match = _URL_FOLDED_CONTINUATION_RE.match(s, end)
+        if match is None:
+            return end
+        end = match.end()
+
+
+def _normalize_url_for_speech(url):
+    return _URL_FOLDED_BREAK_RE.sub("", url)
+
+
+def _text_ends_with_url(s):
+    end = len(s.rstrip())
+    if end == 0:
+        return False
+    for match in _URL_RE.finditer(s[:end]):
+        if _extend_url_end(s, match.end()) == end:
+            return True
+    return False
+
+
+def _starts_with_url_continuation(s):
+    match = _URL_ITEM_CONTINUATION_RE.match(s)
+    if match is None:
+        return False
+    continuation = match.group(0)
+    return len(continuation) > 1 or s == "/"
+
+
+def _merge_split_url_strings(seq):
+    merged = []
+    for item in seq:
+        if (
+            isinstance(item, str)
+            and merged
+            and isinstance(merged[-1], str)
+            and _text_ends_with_url(merged[-1])
+            and _starts_with_url_continuation(item)
+        ):
+            merged[-1] += item
+            continue
+        merged.append(item)
+    return merged
+
+
+def _strong_language_kind(char):
+    """Return a language only for Japanese characters or ASCII letters."""
+    if char2kind(ord(char)) == _umlCodes.JAPANESE:
+        return _umlCodes.JAPANESE
+    if ('A' <= char <= 'Z') or ('a' <= char <= 'z'):
+        return _umlCodes.ENGLISH
+    return None
+
+
+def _is_part_of_multi_dot_number(s, start, end):
+    """Do not reinterpret version numbers or IP-like dotted sequences as decimals."""
+    has_numeric_part_before = (
+        start >= 2 and s[start - 1] == '.' and s[start - 2].isdigit()
+    )
+    has_numeric_part_after = (
+        end + 1 < len(s) and s[end] == '.' and s[end + 1].isdigit()
+    )
+    return has_numeric_part_before or has_numeric_part_after
+
+
+def _number_context_language(s, start, end, last_lang):
+    # A directly attached Japanese counter or unit is more tightly bound to the
+    # number than an English label on the left. Keep the number and suffix in
+    # the same Japanese chunk (for example, "pending: 72件").
+    if any(s.startswith(suffix, end) for suffix in _JAPANESE_NUMBER_SUFFIXES):
+        return _umlCodes.JAPANESE
+
+    # Prefer the nearest real language character on the left. Neutral characters
+    # such as whitespace, punctuation, brackets, and other numbers are ignored.
+    for pos in range(start - 1, -1, -1):
+        kind = _strong_language_kind(s[pos])
+        if kind is not None:
+            return kind
+
+    # A number at the beginning of a text item has no left context. In that case,
+    # use the nearest real language character on the right.
+    for pos in range(end, len(s)):
+        kind = _strong_language_kind(s[pos])
+        if kind is not None:
+            return kind
+
+    return last_lang
+
+
+def _number_spans(s, last_lang):
+    spans = {}
+    english_ordinals = {
+        match.start(): match
+        for match in _ENGLISH_ORDINAL_RE.finditer(s)
+    }
+    for match in _NUMBER_RE.finditer(s):
+        start, end = match.span()
+        ordinal_match = english_ordinals.get(start)
+        if ordinal_match is not None:
+            # Keep English ordinals such as "2nd" intact even when they follow
+            # Japanese text. NVDA applies speech dictionaries after UML splits
+            # the sequence, so splitting "2nd" into "2" and "nd" prevents a
+            # dictionary entry for the complete ordinal from matching.
+            spans[start] = (
+                ordinal_match.end(),
+                _umlCodes.ENGLISH,
+            )
+            continue
+        if _is_part_of_multi_dot_number(s, start, end):
+            continue
+        spans[start] = (
+            end,
+            _number_context_language(s, start, end, last_lang),
+        )
+    return spans
 
 
 def stringsplit_word(s, last_lang):
@@ -691,12 +938,29 @@ def stringsplit_word(s, last_lang):
 
     lst = []
     start = 0
-    # set kind using the first char
-    lastkind = str2kind(s, 0, last_lang)
+    number_spans = _number_spans(s, last_lang)
+    if 0 in number_spans:
+        lastkind = number_spans[0][1]
+    else:
+        # set kind using the first char
+        lastkind = str2kind(s, 0, last_lang)
 
-    for pos, c in enumerate(s):
+    pos = 0
+    while pos < len(s):
+        number_span = number_spans.get(pos)
+        if number_span is not None:
+            number_end, kind = number_span
+            if kind != lastkind:
+                lst.extend([LangChangeCommand(lastkind), s[start:pos]])
+                lastkind = kind
+                start = pos
+            pos = number_end
+            continue
+
+        c = s[pos]
         u = ord(c)
         if u == 32:
+            pos += 1
             continue  # spaces don't change anything
         kind = str2kind(s, pos, lastkind)
         if kind != lastkind:  # switched languages
@@ -704,9 +968,10 @@ def stringsplit_word(s, last_lang):
             lastkind = kind
             start = pos
         # end kind is changed?
-    # end enumerate
+        pos += 1
+    # end while
     # The final piece of text that wasn't inserted yet
-    lst.extend([LangChangeCommand(kind), s[start:pos+1]])
+    lst.extend([LangChangeCommand(lastkind), s[start:]])
     return lst
 
 
@@ -735,7 +1000,7 @@ def stringsplit_sentence(s, last_lang):
 def modseq(seq, last_lang, strategy):
     """NVDA's LangChangeCommand only refers markup information like html lang attribute. We want more dynamic change. Process the input sequence and insert LangChangeCommand here."""
     newseq = []
-    for item in seq:
+    for item in _merge_split_url_strings(seq):
         # NVDA uses every IndexCommand for callback delivery and utterance boundaries.
         # Dropping adjacent indexes can break say-all continuation on structured content.
         if isinstance(item, LangChangeCommand):
