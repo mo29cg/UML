@@ -47,6 +47,13 @@ _LOG_BASE = r"\\wsl.localhost\Ubuntu\home\satoshi\GitHub\personal\UML\uml_sayall
 _LOG_FILE = _LOG_BASE + ".log"
 _LOG_SESSIONS_TO_KEEP = 3
 _LOG_PREVIEW_CHARS = 2000
+_LOG_QUEUE_MAX_ITEMS = 8192
+_LOG_WRITER_JOIN_TIMEOUT_SEC = 1.0
+_debugLogQueue = queue.Queue(maxsize=_LOG_QUEUE_MAX_ITEMS)
+_debugLogStopEvent = threading.Event()
+_debugLogThread = None
+_debugLogAccepting = False
+_debugLogStateLock = threading.Lock()
 
 _URL_RE = re.compile(
     r"""(?ix)
@@ -152,15 +159,78 @@ def _rotate_debug_logs():
         os.replace(_LOG_FILE, f"{_LOG_BASE}.1.log")
 
 
+def _debug_log_writer():
+    logFile = None
+    try:
+        while not _debugLogStopEvent.is_set() or not _debugLogQueue.empty():
+            try:
+                line = _debugLogQueue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if logFile is None:
+                    logFile = open(_LOG_FILE, "a", encoding="utf-8", buffering=1)
+                logFile.write(line + "\n")
+            except Exception:
+                if logFile is not None:
+                    try:
+                        logFile.close()
+                    except Exception:
+                        pass
+                    logFile = None
+            finally:
+                _debugLogQueue.task_done()
+    finally:
+        if logFile is not None:
+            try:
+                logFile.close()
+            except Exception:
+                pass
+
+
+def _start_debug_log_writer():
+    global _debugLogThread, _debugLogAccepting
+    with _debugLogStateLock:
+        _debugLogStopEvent.clear()
+        if _debugLogThread is not None and _debugLogThread.is_alive():
+            _debugLogAccepting = True
+            return
+        _debugLogThread = threading.Thread(
+            target=_debug_log_writer,
+            name="synthDrivers.UML.DebugLogWriter",
+            daemon=True,
+        )
+        _debugLogAccepting = True
+        _debugLogThread.start()
+
+
+def _stop_debug_log_writer():
+    global _debugLogThread, _debugLogAccepting
+    with _debugLogStateLock:
+        _debugLogAccepting = False
+        thread = _debugLogThread
+        _debugLogStopEvent.set()
+    if thread is not None:
+        thread.join(timeout=_LOG_WRITER_JOIN_TIMEOUT_SEC)
+    with _debugLogStateLock:
+        if (
+            thread is not None
+            and _debugLogThread is thread
+            and not thread.is_alive()
+        ):
+            _debugLogThread = None
+
+
 def _write_debug_log(event, **fields):
+    if not _debugLogAccepting:
+        return
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         payload = " | ".join(f"{k}={v}" for k, v in fields.items())
         line = f"[{timestamp}] {event}"
         if payload:
             line += f" | {payload}"
-        with open(_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        _debugLogQueue.put_nowait(line)
     except Exception:
         pass
 
@@ -295,6 +365,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
     def __init__(self):
         _rotate_debug_logs()
+        _start_debug_log_writer()
         _write_debug_log("uml_init")
         self.strategy = "word"
         if "strategy" in config.conf["UML_global"]:
@@ -379,6 +450,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         bgQueue.put((None, None, None))
         self.thread.join()
         _write_debug_log("terminate_done", force=True)
+        _stop_debug_log_writer()
 
     def speak(self, seq):
         self._debugSpeakSeq += 1
