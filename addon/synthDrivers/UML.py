@@ -83,7 +83,18 @@ _URL_FOLDED_CONTINUATION_RE = re.compile(
 )
 _URL_FOLDED_BREAK_RE = re.compile(r"\r?\n(?=[-._~%!$&*+,;=:@/?#])")
 _URL_ITEM_CONTINUATION_RE = re.compile(r"^(?!-\s)[-A-Za-z0-9._~%!$&*+,;=:@/?#]+")
-_NUMBER_RE = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])"
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
+    r"@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
+)
+_NON_WHITESPACE_RE = re.compile(r"\S+")
+_NUMBER_PATTERN = r"\d+(?:,\d{3})*(?:\.\d+)?"
+_NUMBER_RE = re.compile(_NUMBER_PATTERN)
+_JAPANESE_NUMBER_RANGE_RE = re.compile(
+    rf"{_NUMBER_PATTERN}"
+    rf"(?:[\s\u200b\u2060]*[〜～][\s\u200b\u2060]*{_NUMBER_PATTERN})+"
+)
 _ENGLISH_ORDINAL_RE = re.compile(
     r"\d+(?:,\d{3})*(?:st|nd|rd|th)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -144,6 +155,24 @@ _JAPANESE_NUMBER_SUFFIXES = (
     "年",
     "週",
 )
+_NUMBER_SUFFIX_SEPARATORS = " \t\r\n\u00a0\u200b\u2060"
+_LANGUAGE_NEUTRAL_CHARS = _NUMBER_SUFFIX_SEPARATORS + "%"
+_SENTENCE_END_CHARS = "。！？!?"
+_SENTENCE_CLOSING_CHARS = "\"'”’」』】）)]}"
+_JAPANESE_DIGITS = {
+    "0": "零",
+    "1": "一",
+    "2": "二",
+    "3": "三",
+    "4": "四",
+    "5": "五",
+    "6": "六",
+    "7": "七",
+    "8": "八",
+    "9": "九",
+}
+_JAPANESE_SMALL_NUMBER_UNITS = ("", "十", "百", "千")
+_JAPANESE_LARGE_NUMBER_UNITS = ("", "万", "億", "兆", "京", "垓")
 
 
 def _rotate_debug_logs():
@@ -843,14 +872,26 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             self._applyLangSettings(lang, synth)
 
 
-def stringsplit(s, last_lang, strategy):
+def stringsplit(
+    s,
+    last_lang,
+    strategy,
+    right_context="",
+    forced_number_language=None,
+):
     """Processes speaking text. Returns a newly generated part of SpeechSequence."""
     if s.strip() == '':
         return []
 
     url_matches = list(_URL_RE.finditer(s))
     if not url_matches:
-        return _stringsplit_text(s, last_lang, strategy)
+        return _stringsplit_text(
+            s,
+            last_lang,
+            strategy,
+            right_context,
+            forced_number_language,
+        )
 
     lst = []
     start = 0
@@ -859,7 +900,12 @@ def stringsplit(s, last_lang, strategy):
         if match.start() < start:
             continue
         if match.start() > start:
-            part = _stringsplit_text(s[start:match.start()], current_lang, strategy)
+            part = _stringsplit_text(
+                s[start:match.start()],
+                current_lang,
+                strategy,
+                forced_number_language=forced_number_language,
+            )
             lst.extend(part)
             current_lang = _last_lang_from_sequence(part, current_lang)
         url_end = _extend_url_end(s, match.end())
@@ -871,12 +917,40 @@ def stringsplit(s, last_lang, strategy):
         start = url_end
 
     if start < len(s):
-        lst.extend(_stringsplit_text(s[start:], current_lang, strategy))
+        lst.extend(
+            _stringsplit_text(
+                s[start:],
+                current_lang,
+                strategy,
+                right_context,
+                forced_number_language,
+            )
+        )
     return lst
 
 
-def _stringsplit_text(s, last_lang, strategy):
-    return stringsplit_word(s, last_lang) if strategy == "word" else stringsplit_sentence(s, last_lang)
+def _stringsplit_text(
+    s,
+    last_lang,
+    strategy,
+    right_context="",
+    forced_number_language=None,
+):
+    # NVDA applies its own number normalization after this language-routing
+    # hook. Arabic digits can therefore be rewritten as English words even
+    # inside a Japanese chunk. Convert only numbers bound to an explicit
+    # Japanese counter or unit; this changes speech text, not displayed text.
+    s = _normalize_japanese_suffixed_numbers(s, right_context)
+    return (
+        stringsplit_word(
+            s,
+            last_lang,
+            right_context,
+            forced_number_language,
+        )
+        if strategy == "word"
+        else stringsplit_sentence(s, last_lang)
+    )
 
 
 def _last_lang_from_sequence(seq, fallback):
@@ -932,6 +1006,109 @@ def _merge_split_url_strings(seq):
     return merged
 
 
+def _next_text_context(seq, start):
+    """Return the next text item without changing command positions."""
+    for item in seq[start:]:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, (IndexCommand, LangChangeCommand)):
+            continue
+        break
+    return ""
+
+
+def _number_suffix_context(s, end, right_context=""):
+    suffix_context = s[end:]
+    if not suffix_context.lstrip(_NUMBER_SUFFIX_SEPARATORS):
+        suffix_context += right_context
+    return suffix_context.lstrip(_NUMBER_SUFFIX_SEPARATORS)
+
+
+def _has_japanese_number_suffix(s, end, right_context=""):
+    suffix_context = _number_suffix_context(s, end, right_context)
+    return any(
+        suffix_context.startswith(suffix)
+        for suffix in _JAPANESE_NUMBER_SUFFIXES
+    )
+
+
+def _four_digit_number_to_japanese(value):
+    parts = []
+    for power in range(3, -1, -1):
+        digit = (value // (10 ** power)) % 10
+        if digit == 0:
+            continue
+        if digit != 1 or power == 0:
+            parts.append(_JAPANESE_DIGITS[str(digit)])
+        if power > 0:
+            parts.append(_JAPANESE_SMALL_NUMBER_UNITS[power])
+    return "".join(parts)
+
+
+def _integer_to_japanese_number(digits):
+    if not digits or any(char not in _JAPANESE_DIGITS for char in digits):
+        return None
+    if len(digits) > len(_JAPANESE_LARGE_NUMBER_UNITS) * 4:
+        return None
+    value = int(digits)
+    if value == 0:
+        return _JAPANESE_DIGITS["0"]
+
+    groups = []
+    while value:
+        groups.append(value % 10000)
+        value //= 10000
+    if len(groups) > len(_JAPANESE_LARGE_NUMBER_UNITS):
+        return None
+
+    parts = []
+    for group_index in range(len(groups) - 1, -1, -1):
+        group = groups[group_index]
+        if group == 0:
+            continue
+        parts.append(_four_digit_number_to_japanese(group))
+        if group_index:
+            parts.append(_JAPANESE_LARGE_NUMBER_UNITS[group_index])
+    return "".join(parts)
+
+
+def _number_to_japanese_number(number):
+    normalized = number.replace(",", "")
+    integer_digits, dot, fractional_digits = normalized.partition(".")
+    integer = _integer_to_japanese_number(integer_digits)
+    if integer is None:
+        return None
+    if not dot:
+        return integer
+    if (
+        not fractional_digits
+        or any(char not in _JAPANESE_DIGITS for char in fractional_digits)
+    ):
+        return None
+    return (
+        integer
+        + "点"
+        + "".join(_JAPANESE_DIGITS[char] for char in fractional_digits)
+    )
+
+
+def _normalize_japanese_suffixed_numbers(s, right_context=""):
+    japanese_range_number_starts = _japanese_range_number_starts(s)
+    for match in reversed(list(_NUMBER_RE.finditer(s))):
+        start, end = match.span()
+        if _is_part_of_multi_dot_number(s, start, end):
+            continue
+        if (
+            start not in japanese_range_number_starts
+            and not _has_japanese_number_suffix(s, end, right_context)
+        ):
+            continue
+        replacement = _number_to_japanese_number(match.group(0))
+        if replacement is not None:
+            s = s[:start] + replacement + s[end:]
+    return s
+
+
 def _strong_language_kind(char):
     """Return a language only for Japanese characters or ASCII letters."""
     if char2kind(ord(char)) == _umlCodes.JAPANESE:
@@ -952,11 +1129,282 @@ def _is_part_of_multi_dot_number(s, start, end):
     return has_numeric_part_before or has_numeric_part_after
 
 
-def _number_context_language(s, start, end, last_lang):
+def _is_ascii_identifier_char(char):
+    return char == "_" or (
+        char.isascii() and (char.isalpha() or char.isdigit())
+    )
+
+
+def _is_part_of_ascii_identifier(s, start, end):
+    """Keep digits in tokens such as GPT-5, H264, and 2FA language-bound."""
+    if start > 0 and _is_ascii_identifier_char(s[start - 1]):
+        return True
+    if end < len(s) and _is_ascii_identifier_char(s[end]):
+        return True
+    if (
+        start > 1
+        and s[start - 1] in "-_"
+        and _is_ascii_identifier_char(s[start - 2])
+    ):
+        return True
+    if (
+        end + 1 < len(s)
+        and s[end] in "-_"
+        and _is_ascii_identifier_char(s[end + 1])
+    ):
+        return True
+    return False
+
+
+def _is_japanese_text_char(char):
+    codepoint = ord(char)
+    return (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x4E00 <= codepoint <= 0x9FBF
+        or 0xFF66 <= codepoint <= 0xFF9F
+    )
+
+
+def _text_language_kind(char):
+    if _is_japanese_text_char(char):
+        return _umlCodes.JAPANESE
+    if ("A" <= char <= "Z") or ("a" <= char <= "z"):
+        return _umlCodes.ENGLISH
+    return None
+
+
+def _looks_like_file_path(token):
+    stripped = token.strip(
+        "\"'“”‘’()[]{}<>「」『』【】、。,;:!?"
+    )
+    if "\\" in stripped:
+        return True
+    if stripped.startswith(("/", "./", "../", "~/")):
+        return True
+    return (
+        "/" in stripped
+        and any(
+            char.isascii() and char.isalpha()
+            for char in stripped
+        )
+    )
+
+
+def _opaque_number_ranges(s):
+    ranges = [
+        (match.start(), _extend_url_end(s, match.end()))
+        for match in _URL_RE.finditer(s)
+    ]
+    ranges.extend(match.span() for match in _EMAIL_RE.finditer(s))
+    ranges.extend(
+        match.span()
+        for match in _NON_WHITESPACE_RE.finditer(s)
+        if _looks_like_file_path(match.group(0))
+    )
+    return ranges
+
+
+def _range_contains_position(ranges, pos):
+    return any(start <= pos < end for start, end in ranges)
+
+
+def _unifiable_number_languages(s, last_lang):
+    """Return local language decisions for ordinary, non-identifier numbers."""
+    opaque_number_ranges = _opaque_number_ranges(s)
+    ordinal_starts = {
+        match.start()
+        for match in _ENGLISH_ORDINAL_RE.finditer(s)
+    }
+    japanese_range_number_starts = _japanese_range_number_starts(s)
+    languages = []
+    for match in _NUMBER_RE.finditer(s):
+        start, end = match.span()
+        if (
+            start in ordinal_starts
+            or _is_part_of_multi_dot_number(s, start, end)
+            or _is_part_of_ascii_identifier(s, start, end)
+            or _range_contains_position(opaque_number_ranges, start)
+        ):
+            continue
+        if start in japanese_range_number_starts:
+            languages.append(_umlCodes.JAPANESE)
+            continue
+        languages.append(
+            _number_context_language(s, start, end, last_lang)
+        )
+    return languages
+
+
+def _sentence_prefers_japanese(s):
+    return (
+        any(_is_japanese_text_char(char) for char in s)
+        or bool(_JAPANESE_NUMBER_RANGE_RE.search(s))
+    )
+
+
+def _sentence_ranges(s):
+    """Yield logical sentence ranges without splitting decimals or URLs."""
+    if not s:
+        return
+    url_ranges = [
+        (match.start(), _extend_url_end(s, match.end()))
+        for match in _URL_RE.finditer(s)
+    ]
+    start = 0
+    pos = 0
+    while pos < len(s):
+        if _range_contains_position(url_ranges, pos):
+            pos += 1
+            continue
+        char = s[pos]
+        end = None
+        if char == "\r":
+            end = pos + 2 if pos + 1 < len(s) and s[pos + 1] == "\n" else pos + 1
+        elif char == "\n":
+            end = pos + 1
+        elif char in _SENTENCE_END_CHARS:
+            end = pos + 1
+        elif (
+            char == "."
+            and (
+                pos + 1 == len(s)
+                or s[pos + 1].isspace()
+                or s[pos + 1] in _SENTENCE_CLOSING_CHARS
+            )
+        ):
+            end = pos + 1
+
+        if end is None:
+            pos += 1
+            continue
+
+        while end < len(s) and s[end] in _SENTENCE_END_CHARS:
+            end += 1
+        while end < len(s) and s[end] in _SENTENCE_CLOSING_CHARS:
+            end += 1
+        yield start, end
+        start = end
+        pos = end
+
+    if start < len(s):
+        yield start, len(s)
+
+
+def _last_text_language(s, fallback):
+    for char in reversed(s):
+        kind = _text_language_kind(char)
+        if kind is not None:
+            return kind
+    return fallback
+
+
+def _number_language_annotations(seq, last_lang):
+    """Map text item slices to one ordinary-number language per sentence."""
+    annotations = {}
+    current_group = []
+    current_text_length = 0
+    current_lang = last_lang
+
+    def flush_group():
+        nonlocal current_group, current_text_length, current_lang
+        if not current_group:
+            return
+
+        group_text = "".join(text for _, _, _, text in current_group)
+        for sentence_start, sentence_end in _sentence_ranges(group_text):
+            sentence = group_text[sentence_start:sentence_end]
+            local_languages = _unifiable_number_languages(
+                sentence,
+                current_lang,
+            )
+            forced_language = None
+            if local_languages:
+                unique_languages = set(local_languages)
+                if len(unique_languages) == 1:
+                    forced_language = local_languages[0]
+                elif _sentence_prefers_japanese(sentence):
+                    forced_language = _umlCodes.JAPANESE
+                else:
+                    forced_language = _umlCodes.ENGLISH
+
+            for item_pos, item_start, item_end, _ in current_group:
+                overlap_start = max(sentence_start, item_start)
+                overlap_end = min(sentence_end, item_end)
+                if overlap_start >= overlap_end:
+                    continue
+                annotations.setdefault(item_pos, []).append(
+                    (
+                        overlap_start - item_start,
+                        overlap_end - item_start,
+                        forced_language,
+                    )
+                )
+
+            current_lang = _last_text_language(sentence, current_lang)
+            if not any(
+                _text_language_kind(char) is not None
+                for char in sentence
+            ) and forced_language is not None:
+                current_lang = forced_language
+
+        current_group = []
+        current_text_length = 0
+
+    for item_pos, item in enumerate(seq):
+        if isinstance(item, str):
+            item_start = current_text_length
+            current_text_length += len(item)
+            current_group.append(
+                (item_pos, item_start, current_text_length, item)
+            )
+        elif not isinstance(item, (IndexCommand, LangChangeCommand)):
+            flush_group()
+    flush_group()
+
+    for item_pos, item_annotations in annotations.items():
+        merged_annotations = []
+        for start, end, language in item_annotations:
+            if (
+                merged_annotations
+                and merged_annotations[-1][1] == start
+                and merged_annotations[-1][2] == language
+            ):
+                previous_start, _, _ = merged_annotations[-1]
+                merged_annotations[-1] = (
+                    previous_start,
+                    end,
+                    language,
+                )
+            else:
+                merged_annotations.append((start, end, language))
+        annotations[item_pos] = merged_annotations
+
+    return annotations
+
+
+def _japanese_range_number_starts(s):
+    """Return numbers joined by a Japanese wave-dash range separator."""
+    starts = set()
+    for range_match in _JAPANESE_NUMBER_RANGE_RE.finditer(s):
+        starts.update(
+            match.start()
+            for match in _NUMBER_RE.finditer(
+                s,
+                range_match.start(),
+                range_match.end(),
+            )
+        )
+    return starts
+
+
+def _number_context_language(s, start, end, last_lang, right_context=""):
     # A directly attached Japanese counter or unit is more tightly bound to the
     # number than an English label on the left. Keep the number and suffix in
-    # the same Japanese chunk (for example, "pending: 72件").
-    if any(s.startswith(suffix, end) for suffix in _JAPANESE_NUMBER_SUFFIXES):
+    # the same Japanese chunk (for example, "pending: 72件"). NVDA may put the
+    # number and suffix in separate text items with an IndexCommand between
+    # them. Renderers can also leave whitespace or zero-width separators at the
+    # item boundary, so ignore only those characters when checking the suffix.
+    if _has_japanese_number_suffix(s, end, right_context):
         return _umlCodes.JAPANESE
 
     # Prefer the nearest real language character on the left. Neutral characters
@@ -976,8 +1424,15 @@ def _number_context_language(s, start, end, last_lang):
     return last_lang
 
 
-def _number_spans(s, last_lang):
+def _number_spans(
+    s,
+    last_lang,
+    right_context="",
+    forced_number_language=None,
+):
     spans = {}
+    opaque_number_ranges = _opaque_number_ranges(s)
+    japanese_range_number_starts = _japanese_range_number_starts(s)
     english_ordinals = {
         match.start(): match
         for match in _ENGLISH_ORDINAL_RE.finditer(s)
@@ -997,25 +1452,66 @@ def _number_spans(s, last_lang):
             continue
         if _is_part_of_multi_dot_number(s, start, end):
             continue
+        if start in japanese_range_number_starts:
+            spans[start] = (end, _umlCodes.JAPANESE)
+            continue
+        local_language = _number_context_language(
+            s,
+            start,
+            end,
+            last_lang,
+            right_context,
+        )
         spans[start] = (
             end,
-            _number_context_language(s, start, end, last_lang),
+            forced_number_language
+            if (
+                forced_number_language is not None
+                and not _is_part_of_ascii_identifier(s, start, end)
+                and not _range_contains_position(
+                    opaque_number_ranges,
+                    start,
+                )
+            )
+            else local_language,
         )
     return spans
 
 
-def stringsplit_word(s, last_lang):
+def stringsplit_word(
+    s,
+    last_lang,
+    right_context="",
+    forced_number_language=None,
+):
     if s.strip() == '':
         return []
 
     lst = []
     start = 0
-    number_spans = _number_spans(s, last_lang)
+    number_spans = _number_spans(
+        s,
+        last_lang,
+        right_context,
+        forced_number_language,
+    )
     if 0 in number_spans:
         lastkind = number_spans[0][1]
     else:
-        # set kind using the first char
-        lastkind = str2kind(s, 0, last_lang)
+        # Leading layout whitespace is neutral. Classify it with the first real
+        # character so it does not create a synthetic language switch between a
+        # split number and its suffix.
+        first_content_pos = next(
+            (
+                pos
+                for pos, char in enumerate(s)
+                if char not in _LANGUAGE_NEUTRAL_CHARS
+            ),
+            None,
+        )
+        if first_content_pos is None:
+            return []
+        lastkind = str2kind(s, first_content_pos, last_lang)
 
     pos = 0
     while pos < len(s):
@@ -1031,7 +1527,7 @@ def stringsplit_word(s, last_lang):
 
         c = s[pos]
         u = ord(c)
-        if u == 32:
+        if c in _LANGUAGE_NEUTRAL_CHARS:
             pos += 1
             continue  # spaces don't change anything
         kind = str2kind(s, pos, lastkind)
@@ -1072,7 +1568,14 @@ def stringsplit_sentence(s, last_lang):
 def modseq(seq, last_lang, strategy):
     """NVDA's LangChangeCommand only refers markup information like html lang attribute. We want more dynamic change. Process the input sequence and insert LangChangeCommand here."""
     newseq = []
-    for item in _merge_split_url_strings(seq):
+    merged_seq = _merge_split_url_strings(seq)
+    number_language_annotations = (
+        _number_language_annotations(merged_seq, last_lang)
+        if strategy == "word"
+        else {}
+    )
+    current_lang = last_lang
+    for pos, item in enumerate(merged_seq):
         # NVDA uses every IndexCommand for callback delivery and utterance boundaries.
         # Dropping adjacent indexes can break say-all continuation on structured content.
         if isinstance(item, LangChangeCommand):
@@ -1081,7 +1584,26 @@ def modseq(seq, last_lang, strategy):
         if isinstance(item, str):
             # Convert some chars which some Japanese synths cannot read properly
             item = item.translate(jpn_translate)
-            newseq.extend(stringsplit(item, last_lang, strategy))
+            item_annotations = number_language_annotations.get(
+                pos,
+                [(0, len(item), None)],
+            )
+            for start, end, forced_number_language in item_annotations:
+                fragment = item[start:end]
+                right_context = (
+                    item[end:]
+                    if end < len(item)
+                    else _next_text_context(merged_seq, pos + 1)
+                )
+                part = stringsplit(
+                    fragment,
+                    current_lang,
+                    strategy,
+                    right_context,
+                    forced_number_language,
+                )
+                newseq.extend(part)
+                current_lang = _last_lang_from_sequence(part, current_lang)
         else:
             newseq.append(item)
     return newseq
