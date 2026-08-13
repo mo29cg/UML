@@ -99,6 +99,53 @@ _ENGLISH_ORDINAL_RE = re.compile(
     r"\d+(?:,\d{3})*(?:st|nd|rd|th)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_IDENTIFIER_LABEL_RE = re.compile(
+    r"(?:ID|code|pin|番号|コード|型番|認証コード)"
+    r"\s*(?:[:：#＃]|は|が)?\s*$",
+    re.IGNORECASE,
+)
+_PHONE_OR_POSTAL_RE = re.compile(
+    r"(?<!\d)(?:"
+    r"0\d{1,3}[-‐‑‒–—―ー−]\d{1,4}[-‐‑‒–—―ー−]\d{3,4}"
+    r"|\d{3}[-‐‑‒–—―ー−]\d{4}"
+    r")(?!\d)"
+)
+_JAPANESE_MATH_OPERATOR_RE = re.compile(
+    r"(?<=\d)(\s*)([×÷+＋−－=＝-])(\s*)(?=\d)"
+)
+_JAPANESE_MATH_OPERATOR_WORDS = {
+    "×": "かける",
+    "÷": "わる",
+    "+": "たす",
+    "＋": "たす",
+    "−": "ひく",
+    "－": "ひく",
+    "-": "ひく",
+    "=": "は",
+    "＝": "は",
+}
+_ASCII_QUANTITY_SUFFIXES = (
+    "bb",
+    "bps",
+    "cm",
+    "db",
+    "gb",
+    "ghz",
+    "g",
+    "hz",
+    "kb",
+    "kg",
+    "khz",
+    "km",
+    "l",
+    "mb",
+    "mhz",
+    "ml",
+    "mm",
+    "ms",
+    "m",
+    "tb",
+)
 _JAPANESE_NUMBER_SUFFIXES = (
     "パーセント",
     "ポイント",
@@ -157,8 +204,6 @@ _JAPANESE_NUMBER_SUFFIXES = (
 )
 _NUMBER_SUFFIX_SEPARATORS = " \t\r\n\u00a0\u200b\u2060"
 _LANGUAGE_NEUTRAL_CHARS = _NUMBER_SUFFIX_SEPARATORS + "%"
-_SENTENCE_END_CHARS = "。！？!?"
-_SENTENCE_CLOSING_CHARS = "\"'”’」』】）)]}"
 _JAPANESE_DIGITS = {
     "0": "零",
     "1": "一",
@@ -938,9 +983,24 @@ def _stringsplit_text(
 ):
     # NVDA applies its own number normalization after this language-routing
     # hook. Arabic digits can therefore be rewritten as English words even
-    # inside a Japanese chunk. Convert only numbers bound to an explicit
-    # Japanese counter or unit; this changes speech text, not displayed text.
-    s = _normalize_japanese_suffixed_numbers(s, right_context)
+    # inside a Japanese chunk. Convert ordinary numbers only when this line's
+    # routing selected Japanese, while preserving identifier-like numbers.
+    # This changes speech text, not displayed text.
+    normalize_ordinary_numbers = (
+        forced_number_language == _umlCodes.JAPANESE
+        or (
+            strategy == "sentence"
+            and _text_prefers_japanese(s)
+        )
+    )
+    if normalize_ordinary_numbers:
+        s = _normalize_japanese_math_operators(s)
+    s = _normalize_japanese_numbers_for_speech(
+        s,
+        right_context,
+        normalize_ordinary_numbers,
+        last_lang,
+    )
     return (
         stringsplit_word(
             s,
@@ -1092,15 +1152,85 @@ def _number_to_japanese_number(number):
     )
 
 
-def _normalize_japanese_suffixed_numbers(s, right_context=""):
+def _has_identifier_leading_zero(number):
+    normalized = number.replace(",", "")
+    integer_digits, dot, _ = normalized.partition(".")
+    return not dot and len(integer_digits) > 1 and integer_digits.startswith("0")
+
+
+def _is_labeled_identifier_number(s, start):
+    return bool(_IDENTIFIER_LABEL_RE.search(s[:start]))
+
+
+def _has_ascii_quantity_suffix(s, end, right_context=""):
+    suffix = _number_suffix_context(s, end, right_context).lower()
+    return any(
+        suffix.startswith(unit)
+        and (
+            len(suffix) == len(unit)
+            or not suffix[len(unit)].isascii()
+            or not suffix[len(unit)].isalpha()
+        )
+        for unit in _ASCII_QUANTITY_SUFFIXES
+    )
+
+
+def _normalize_japanese_math_operators(s):
+    def replace_operator(match):
+        left_space, operator, right_space = match.groups()
+        # A bare ASCII hyphen between digits is more likely a range or an ID.
+        if operator == "-" and (not left_space or not right_space):
+            return match.group(0)
+        return " " + _JAPANESE_MATH_OPERATOR_WORDS[operator] + " "
+
+    return _JAPANESE_MATH_OPERATOR_RE.sub(replace_operator, s)
+
+
+def _normalize_japanese_numbers_for_speech(
+    s,
+    right_context="",
+    normalize_ordinary_numbers=False,
+    last_lang=_umlCodes.JAPANESE,
+):
     japanese_range_number_starts = _japanese_range_number_starts(s)
+    opaque_number_ranges = _opaque_number_ranges(s)
+    ordinal_starts = {
+        match.start()
+        for match in _ENGLISH_ORDINAL_RE.finditer(s)
+    }
     for match in reversed(list(_NUMBER_RE.finditer(s))):
         start, end = match.span()
         if _is_part_of_multi_dot_number(s, start, end):
             continue
         if (
-            start not in japanese_range_number_starts
-            and not _has_japanese_number_suffix(s, end, right_context)
+            start in ordinal_starts
+            or (
+                _is_part_of_ascii_identifier(s, start, end)
+                and not _has_ascii_quantity_suffix(s, end, right_context)
+            )
+            or _range_contains_position(opaque_number_ranges, start)
+            or _has_identifier_leading_zero(match.group(0))
+            or _is_labeled_identifier_number(s, start)
+        ):
+            continue
+        explicitly_japanese = (
+            start in japanese_range_number_starts
+            or _has_japanese_number_suffix(s, end, right_context)
+        )
+        locally_japanese = (
+            _number_context_language(
+                s,
+                start,
+                end,
+                last_lang,
+                right_context,
+            )
+            == _umlCodes.JAPANESE
+        )
+        if (
+            not explicitly_japanese
+            and not normalize_ordinary_numbers
+            and not locally_japanese
         ):
             continue
         replacement = _number_to_japanese_number(match.group(0))
@@ -1196,6 +1326,7 @@ def _opaque_number_ranges(s):
         for match in _URL_RE.finditer(s)
     ]
     ranges.extend(match.span() for match in _EMAIL_RE.finditer(s))
+    ranges.extend(match.span() for match in _PHONE_OR_POSTAL_RE.finditer(s))
     ranges.extend(
         match.span()
         for match in _NON_WHITESPACE_RE.finditer(s)
@@ -1235,15 +1366,15 @@ def _unifiable_number_languages(s, last_lang):
     return languages
 
 
-def _sentence_prefers_japanese(s):
+def _text_prefers_japanese(s):
     return (
         any(_is_japanese_text_char(char) for char in s)
         or bool(_JAPANESE_NUMBER_RANGE_RE.search(s))
     )
 
 
-def _sentence_ranges(s):
-    """Yield logical sentence ranges without splitting decimals or URLs."""
+def _line_ranges(s):
+    """Yield logical line ranges, keeping each line break with its line."""
     if not s:
         return
     url_ranges = [
@@ -1257,31 +1388,13 @@ def _sentence_ranges(s):
             pos += 1
             continue
         char = s[pos]
-        end = None
         if char == "\r":
             end = pos + 2 if pos + 1 < len(s) and s[pos + 1] == "\n" else pos + 1
         elif char == "\n":
             end = pos + 1
-        elif char in _SENTENCE_END_CHARS:
-            end = pos + 1
-        elif (
-            char == "."
-            and (
-                pos + 1 == len(s)
-                or s[pos + 1].isspace()
-                or s[pos + 1] in _SENTENCE_CLOSING_CHARS
-            )
-        ):
-            end = pos + 1
-
-        if end is None:
+        else:
             pos += 1
             continue
-
-        while end < len(s) and s[end] in _SENTENCE_END_CHARS:
-            end += 1
-        while end < len(s) and s[end] in _SENTENCE_CLOSING_CHARS:
-            end += 1
         yield start, end
         start = end
         pos = end
@@ -1299,7 +1412,7 @@ def _last_text_language(s, fallback):
 
 
 def _number_language_annotations(seq, last_lang):
-    """Map text item slices to one ordinary-number language per sentence."""
+    """Map text item slices to one ordinary-number language per line."""
     annotations = {}
     current_group = []
     current_text_length = 0
@@ -1311,10 +1424,10 @@ def _number_language_annotations(seq, last_lang):
             return
 
         group_text = "".join(text for _, _, _, text in current_group)
-        for sentence_start, sentence_end in _sentence_ranges(group_text):
-            sentence = group_text[sentence_start:sentence_end]
+        for line_start, line_end in _line_ranges(group_text):
+            line = group_text[line_start:line_end]
             local_languages = _unifiable_number_languages(
-                sentence,
+                line,
                 current_lang,
             )
             forced_language = None
@@ -1322,14 +1435,14 @@ def _number_language_annotations(seq, last_lang):
                 unique_languages = set(local_languages)
                 if len(unique_languages) == 1:
                     forced_language = local_languages[0]
-                elif _sentence_prefers_japanese(sentence):
+                elif _text_prefers_japanese(line):
                     forced_language = _umlCodes.JAPANESE
                 else:
                     forced_language = _umlCodes.ENGLISH
 
             for item_pos, item_start, item_end, _ in current_group:
-                overlap_start = max(sentence_start, item_start)
-                overlap_end = min(sentence_end, item_end)
+                overlap_start = max(line_start, item_start)
+                overlap_end = min(line_end, item_end)
                 if overlap_start >= overlap_end:
                     continue
                 annotations.setdefault(item_pos, []).append(
@@ -1340,10 +1453,10 @@ def _number_language_annotations(seq, last_lang):
                     )
                 )
 
-            current_lang = _last_text_language(sentence, current_lang)
+            current_lang = _last_text_language(line, current_lang)
             if not any(
                 _text_language_kind(char) is not None
-                for char in sentence
+                for char in line
             ) and forced_language is not None:
                 current_lang = forced_language
 
