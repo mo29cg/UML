@@ -127,15 +127,15 @@ class NumberLanguageSequenceTest(unittest.TestCase):
         result = run_uml_pipeline(["1,958 × 6 = 11,748円"])
 
         self.assertEqual(
-            [("ja", "千九百五十八 かける 六 は 一万千七百四十八円")],
+            [("ja", "千九百五十八 かける 六 イコール 一万千七百四十八円")],
             language_chunks(result),
         )
 
     def test_japanese_calculation_reads_other_operators_as_words(self):
-        result = run_uml_pipeline(["12 ÷ 3 + 2 - 1 = 5です"])
+        result = run_uml_pipeline(["12 ÷ 3 + 2 - 1 ＝ 5です"])
 
         self.assertEqual(
-            [("ja", "十二 わる 三 たす 二 ひく 一 は 五です")],
+            [("ja", "十二 わる 三 たす 二 ひく 一 イコール 五です")],
             language_chunks(result),
         )
 

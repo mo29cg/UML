@@ -121,8 +121,8 @@ _JAPANESE_MATH_OPERATOR_WORDS = {
     "−": "ひく",
     "－": "ひく",
     "-": "ひく",
-    "=": "は",
-    "＝": "は",
+    "=": "イコール",
+    "＝": "イコール",
 }
 _ASCII_QUANTITY_SUFFIXES = (
     "bb",
