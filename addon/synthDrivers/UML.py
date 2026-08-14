@@ -216,6 +216,18 @@ _JAPANESE_DIGITS = {
     "8": "八",
     "9": "九",
 }
+_JAPANESE_FRACTIONAL_DIGIT_READINGS = {
+    "0": "ぜろ",
+    "1": "いち",
+    "2": "に",
+    "3": "さん",
+    "4": "よん",
+    "5": "ご",
+    "6": "ろく",
+    "7": "なな",
+    "8": "はち",
+    "9": "きゅう",
+}
 _JAPANESE_SMALL_NUMBER_UNITS = ("", "十", "百", "千")
 _JAPANESE_LARGE_NUMBER_UNITS = ("", "万", "億", "兆", "京", "垓")
 
@@ -1145,10 +1157,18 @@ def _number_to_japanese_number(number):
         or any(char not in _JAPANESE_DIGITS for char in fractional_digits)
     ):
         return None
+    # Adjacent kanji digits can be recombined as one quantity by Japanese
+    # synthesizers (for example, HISS reads "八八" as 88).  Use phonetic
+    # readings for multi-digit fractions so every digit remains distinct.
+    fractional_digit_readings = (
+        _JAPANESE_DIGITS
+        if len(fractional_digits) == 1
+        else _JAPANESE_FRACTIONAL_DIGIT_READINGS
+    )
     return (
         integer
         + "点"
-        + "".join(_JAPANESE_DIGITS[char] for char in fractional_digits)
+        + "".join(fractional_digit_readings[char] for char in fractional_digits)
     )
 
 

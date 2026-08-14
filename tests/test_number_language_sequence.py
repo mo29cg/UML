@@ -59,7 +59,7 @@ class NumberLanguageSequenceTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("en", "- Q92: CB "),
-                ("ja", "十七点九六%。三十三% "),
+                ("ja", "十七点きゅうろく%。三十三% "),
                 ("en", "pot"),
                 ("ja", "と五十% "),
                 ("en", "pot"),
@@ -67,6 +67,47 @@ class NumberLanguageSequenceTest(unittest.TestCase):
             ],
             language_chunks(result),
         )
+
+    def test_every_two_digit_fraction_uses_unambiguous_digit_readings(self):
+        module, _ = load_uml_module()
+        digit_readings = (
+            "ぜろ",
+            "いち",
+            "に",
+            "さん",
+            "よん",
+            "ご",
+            "ろく",
+            "なな",
+            "はち",
+            "きゅう",
+        )
+
+        for value in range(100):
+            fractional_digits = f"{value:02d}"
+            expected_fraction = "".join(
+                digit_readings[int(digit)] for digit in fractional_digits
+            )
+            with self.subTest(fractional_digits=fractional_digits):
+                self.assertEqual(
+                    "二点" + expected_fraction,
+                    module._number_to_japanese_number(
+                        "2." + fractional_digits
+                    ),
+                )
+
+    def test_multi_digit_fraction_is_phonetic_in_speech_pipeline(self):
+        result = run_uml_pipeline(
+            ["オールイン: 2.88%、控え: 2.880%"]
+        )
+        chunks = language_chunks(result)
+
+        self.assertEqual(
+            "オールイン: 二点はちはち%、控え: 二点はちはちぜろ%",
+            "".join(text for _, text in chunks),
+        )
+        self.assertIn(("ja", "二点はちはち%、控え"), chunks)
+        self.assertIn(("ja", "二点はちはちぜろ%"), chunks)
 
     def test_number_language_does_not_cross_line_boundaries(self):
         result = run_uml_pipeline(["CPU 80%\n温度は35度"])
